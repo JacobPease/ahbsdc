@@ -391,16 +391,21 @@ logic [31:0] fifo_din = en_rx_fifo ? data_in_rx_fifo : m_bus_dat_i; // INAXI: m_
   // are both high? So only allow writes to the fifo if the bus is ready to accept them,
 
   // Something tells me this is the spot where it chooses to talk to the sdcard or bus
-logic fifo_we = en_rx_fifo ? rx_fifo_we && clock_posedge : m_axi_rready && m_axi_rvalid;
-logic fifo_re = en_rx_fifo ? m_axi_wready && m_axi_wvalid : tx_fifo_re && clock_posedge;
+  //                                    RX                              TX
+// logic fifo_we = en_rx_fifo ? rx_fifo_we && clock_posedge : m_axi_rready && m_axi_rvalid;
+  // logic fifo_re = en_rx_fifo ? m_axi_wready && m_axi_wvalid : tx_fifo_re && clock_posedge;
+  logic fifo_we = en_rx_fifo ? rx_fifo_we && clock_posedge : HREADY; // I think HREADY is appropriate here?
+  logic fifo_re = en_rx_fifo ? HREADY : tx_fifo_re && clock_posedge;
 logic [31:0] fifo_dout;
 
+  // This messes with the clock
 assign fifo_almost_full = fifo_data_len > (1 << fifo_addr_bits) * 3 / 4;
 assign fifo_almost_empty = fifo_free_len > (1 << fifo_addr_bits) * 3 / 4;
 
-  // I have no idea what stb stands for, but it must be something like start buffer?
+  // This decides when to start the bus. I believe it means tx_start_bus and rx_start_bus
+  //
 logic tx_stb = en_tx_fifo && fifo_free_len >= (1 << fifo_addr_bits) / 3;
-logic rx_stb = en_rx_fifo && m_axi_bresp_cnt != 3'b111 && (fifo_data_len >= (1 << fifo_addr_bits) / 3 || (!fifo_empty && !data_busy));
+logic rx_stb = en_rx_fifo && (fifo_data_len >= (1 << fifo_addr_bits) / 3 || (!fifo_empty && !data_busy));
 
 // Based on what I can tell, this fifo doubles as both the
 // transfer fifo and the receiver fifo depending on what state
@@ -437,22 +442,26 @@ logic [7:0] m_axi_wcnt; //
 logic [dma_addr_bits-1:2] m_bus_adr_o; 
 logic m_bus_error; // 
 
-assign m_axi_bready = m_axi_bresp_cnt != 0; // OUTAXI
-assign m_axi_rready = m_axi_cyc & !m_axi_write; // OUTAXI
+// assign m_axi_bready = m_axi_bresp_cnt != 0; // OUTAXI
+// assign m_axi_rready = m_axi_cyc & !m_axi_write; // OUTAXI
 // OUTAXI: It appears that m_bus_dat_i is simply and endian swapped rdata. Interesting. 
-assign m_bus_dat_i = {m_axi_rdata[7:0],m_axi_rdata[15:8],m_axi_rdata[23:16],m_axi_rdata[31:24]};
-assign m_axi_wdata = {fifo_dout[7:0],fifo_dout[15:8],fifo_dout[23:16],fifo_dout[31:24]};
+  // assign m_bus_dat_i = {m_axi_rdata[7:0],m_axi_rdata[15:8],m_axi_rdata[23:16],m_axi_rdata[31:24]};
+  assign m_bus_dat_i = {HRDATA[7:0],HRDATA[15:8],HRDATA[23:16],HRDATA[31:24]}; // TODO: Need to base off of XLEN
+  assign HWDATA = {fifo_dout[7:0],fifo_dout[15:8],fifo_dout[23:16],fifo_dout[31:24]};
 
-// AXI burst cannot cross a 4KB boundary
-logic [fifo_addr_bits-1:0] tx_burst_len;
-logic [fifo_addr_bits-1:0] rx_burst_len;
-assign tx_burst_len = m_bus_adr_o[11:2] + fifo_free_len >= m_bus_adr_o[11:2] ? fifo_free_len - 1 : ~m_bus_adr_o[fifo_addr_bits+1:2];
-assign rx_burst_len = m_bus_adr_o[11:2] + fifo_data_len >= m_bus_adr_o[11:2] ? fifo_data_len - 1 : ~m_bus_adr_o[fifo_addr_bits+1:2];
+  // AXI burst cannot cross a 4KB boundary
+  // AHB burst cannot cross a 1KB boundary
+  logic [fifo_addr_bits-1:0] tx_burst_len;
+  logic [fifo_addr_bits-1:0] rx_burst_len;
 
-assign data_int_status_reg = { data_int_status[`INT_DATA_SIZE-1:1],
-    !en_rx_fifo && !en_tx_fifo && !m_axi_cyc && m_axi_bresp_cnt == 0 && data_int_status[0] };
+  
+  assign tx_burst_len = m_bus_adr_o[9:2] + fifo_free_len >= m_bus_adr_o[9:2] ? fifo_free_len - 1 : ~m_bus_adr_o[fifo_addr_bits+1:2];
+  assign rx_burst_len = m_bus_adr_o[9:2] + fifo_data_len >= m_bus_adr_o[9:2] ? fifo_data_len - 1 : ~m_bus_adr_o[fifo_addr_bits+1:2];
 
-  logic                    ahb_cyc;
+  assign data_int_status_reg = { data_int_status[`INT_DATA_SIZE-1:1],
+                                 !en_rx_fifo && !en_tx_fifo && !m_axi_cyc && data_int_status[0] };
+
+  logic                      m_ahb_cyc;
 
   // constants
   assign SDCHWSTRB = '1;
@@ -469,7 +478,7 @@ assign data_int_status_reg = { data_int_status[`INT_DATA_SIZE-1:1],
     end else if (ahb_cyc) begin
       
     end else if (tx_stb || rx_stb) begin
-      ahb_cyc <= 1;
+      m_ahb_cyc <= 1;
     end
 
     // m_bus_adr_o assignment. This helps axi burst stuff
@@ -481,15 +490,6 @@ assign data_int_status_reg = { data_int_status[`INT_DATA_SIZE-1:1],
         m_bus_adr_o <= m_bus_adr_o + 1;
     end else if (!m_axi_cyc && !en_rx_fifo && !en_tx_fifo) begin
         m_bus_adr_o <= dma_addr_reg[dma_addr_bits-1:2];
-    end
-
-    // m_axi_bresp_cnt assignment
-    if (reset | ctrl_rst) begin
-        m_axi_bresp_cnt <= 0;
-    end else if ((m_axi_awvalid && m_axi_awready) && !(m_axi_bvalid && m_axi_bready)) begin
-        m_axi_bresp_cnt <= m_axi_bresp_cnt + 1;
-    end else if (!(m_axi_awvalid && m_axi_awready) && (m_axi_bvalid && m_axi_bready)) begin
-        m_axi_bresp_cnt <= m_axi_bresp_cnt - 1;
     end
 
     // m_bus_error assignment
@@ -681,7 +681,7 @@ sd_data_master sd_data_master0(
     .fifo_empty       (fifo_empty),
     .fifo_ready       (fifo_ready),
     .fifo_full        (fifo_full),
-    .bus_cycle        (m_axi_cyc || m_axi_bresp_cnt != 0), // INAXI: Only direct mention of axi here
+    .bus_cycle        (m_ahb_cyc), // INAXI: Only direct mention of axi here
     .xfr_complete     (!data_busy),
     .crc_error        (!data_crc_ok),
     .bus_error        (m_bus_error),
